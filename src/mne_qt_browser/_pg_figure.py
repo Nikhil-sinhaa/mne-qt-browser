@@ -36,6 +36,7 @@ from mne.viz.utils import _merge_annotations, _simplify_float
 from packaging.version import parse
 from pyqtgraph import (
     InfiniteLine,
+    PlotCurveItem,
     PlotItem,
     Point,
     mkPen,
@@ -85,6 +86,7 @@ from mne_qt_browser._graphic_items import (
     Crosshair,
     DataTrace,
     EventLine,
+    OverlayLegend,
     ScaleBar,
     ScaleBarText,
     VLine,
@@ -483,6 +485,8 @@ class MNEQtBrowser(BrowserBase, QMainWindow, metaclass=_PGMetaClass):  # type: i
         # Add traces
         for ch_idx in self.mne.picks:
             DataTrace(self, ch_idx)
+        if getattr(self.mne, "overlays", None):
+            self._setup_overlay_legend()
 
         # Initialize epochs grid
         if self.mne.is_epochs:
@@ -1690,7 +1694,9 @@ class MNEQtBrowser(BrowserBase, QMainWindow, metaclass=_PGMetaClass):  # type: i
             # self.mne.scalings changes behave as they do without precomputation
             norms = self._get_display_norms(self.mne.picks, data)[:, np.newaxis]
             data /= norms
+            self.mne.data_norms = norms[:, 0] / 2  # the overlays are scaled alike
             self.mne.data = data
+            self._update_overlay_data()
             self.mne.zero_line_offset = (
                 None if dc_offset is None else -(dc_offset / norms)[:, 0]
             )
@@ -2350,10 +2356,44 @@ class MNEQtBrowser(BrowserBase, QMainWindow, metaclass=_PGMetaClass):  # type: i
             super().keyPressEvent(event)
 
     def _draw_traces(self):
-        # Update data in traces (=drawing traces)
+        # Update data in traces (=drawing traces), including the overlays
         for trace in self.mne.traces:
             # Update data
             trace.update_data()
+
+    def _draw_overlay_traces(self):
+        # The overlays are drawn by the traces themselves (see DataTrace);
+        # having this method tells MNE-Python that we support overlays.
+        for trace in self.mne.traces:
+            trace.update_overlay_curves()
+
+    def _setup_overlay_legend(self):
+        """Show which color is which (the data of raw and of each overlay)."""
+        legend = OverlayLegend(labelTextColor=_get_color("k", self.mne.dark))
+        legend.setParentItem(self.mne.viewbox)
+        entries = [("raw", _get_color("k", self.mne.dark))] + [
+            (overlay["label"], _get_color(overlay["color"], self.mne.dark))
+            for overlay in self.mne.overlays
+        ]
+        for label, color in entries:
+            legend.addItem(PlotCurveItem(pen=self.mne.mkPen(color, width=2)), label)
+        legend.anchor(itemPos=(1, 0), parentPos=(1, 0), offset=(-10, 10))
+        self.mne.overlay_legend = legend
+        # PyQtGraph anchors the legend using its size at that moment, which can be
+        # off while it is laid out (e.g., after annotations were added), which would
+        # leave it sticking out of the view once it has its size. So check where it
+        # is whenever its geometry changes and anchor it again if needed.
+        legend.geometryChanged.connect(self._overlay_legend_geometry_changed)
+        self.mne.viewbox.sigResized.connect(self._overlay_legend_geometry_changed)
+
+    def _overlay_legend_geometry_changed(self, *_):
+        legend = getattr(self.mne, "overlay_legend", None)
+        if legend is None:
+            return
+        right = legend.pos().x() + legend.boundingRect().width()
+        if abs(right - (self.mne.viewbox.boundingRect().width() - 10)) > 0.5:
+            # (puts it where it should be, so this doesn't loop)
+            legend.anchor(itemPos=(1, 0), parentPos=(1, 0), offset=(-10, 10))
 
     def _get_size(self):
         inch_width = self.width() / self.logicalDpiX()

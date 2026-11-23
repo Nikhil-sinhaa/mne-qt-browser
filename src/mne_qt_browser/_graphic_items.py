@@ -12,6 +12,7 @@ from pyqtgraph import (
     FillBetweenItem,
     InfiniteLine,
     InfLineLabel,
+    LegendItem,
     LinearRegionItem,
     PlotCurveItem,
     PlotDataItem,
@@ -469,6 +470,8 @@ class DataTrace(PlotCurveItem):
         self.color = None
         # Horizontal reference line at this trace's zero (parent traces only)
         self.zero_line = None
+        # Curves of the overlays (see ``plot_raw(overlay=...)``), parent traces only
+        self.overlay_curves = list()
 
         # Attributes for epochs mode
 
@@ -513,6 +516,10 @@ class DataTrace(PlotCurveItem):
             self.mne.traces.remove(self)
             self.mne.plt.removeItem(self.zero_line)
             self.zero_line.deleteLater()
+            for curve in self.overlay_curves:
+                self.mne.plt.removeItem(curve)
+                curve.deleteLater()
+            self.overlay_curves.clear()
         self.deleteLater()
 
     @propagate_to_children
@@ -622,6 +629,8 @@ class DataTrace(PlotCurveItem):
         """Update the zero line's position, e.g. after data, scale or ypos changes."""
         if self.zero_line is not None:
             self.zero_line.setPos(self._true_zero_ypos())
+        for curve in self.overlay_curves:
+            curve.setPos(0, self.ypos)
 
     def _zero_line_pen(self):
         color = _get_color("k", self.mne.dark)
@@ -632,6 +641,8 @@ class DataTrace(PlotCurveItem):
         transform = QTransform()
         transform.scale(1.0, self.mne.scale_factor)
         self.setTransform(transform)
+        for curve in self.overlay_curves:
+            curve.setTransform(transform)
 
     @propagate_to_children
     def update_scale(self):  # noqa: D102
@@ -708,6 +719,64 @@ class DataTrace(PlotCurveItem):
 
         self.setPos(0, self.ypos)
         self.update_zero_line_pos()
+        self.update_overlay_curves()
+
+    def update_overlay_curves(self):
+        """Draw the data of the overlays of this channel on top of the trace."""
+        overlays = getattr(self.mne, "overlays", None)
+        if not overlays or self.parent_trace is not None or self.mne.is_epochs:
+            return
+        overlay_data = getattr(self.mne, "overlay_data", None) or []
+        # one curve per overlay
+        while len(self.overlay_curves) < len(overlays):
+            curve = PlotCurveItem()
+            curve.setClickable(False)
+            curve.setZValue(self.zValue() + 0.5)
+            self.mne.plt.addItem(curve)
+            self.overlay_curves.append(curve)
+        for curve, overlay, loaded in zip(self.overlay_curves, overlays, overlay_data):
+            if loaded is None or self.range_idx >= loaded[1].shape[0]:
+                curve.setVisible(False)
+                continue
+            times, data = loaded
+            # the data of the overlays are scaled as ours, but not inverted
+            data = -data[self.range_idx]
+            if self.mne.clipping == "clamp":
+                data = np.clip(data, -0.5, 0.5)
+            elif self.mne.clipping is not None:
+                data = np.where(
+                    np.abs(data * self.mne.scale_factor) > self.mne.clipping,
+                    np.nan,
+                    data,
+                )
+            if self.mne.decim != 1 and self.mne.decim_data[self.range_idx] != 1:
+                factor = max(
+                    1,
+                    int(
+                        round(
+                            self.mne.decim
+                            * overlay["inst"].info["sfreq"]
+                            / self.mne.info["sfreq"]
+                        )
+                    ),
+                )
+                times, data = times[::factor], data[::factor]
+            finite = self.mne.clipping is not None and self.mne.clipping != "clamp"
+            if finite:  # see update_data()
+                idx = np.flatnonzero(np.isfinite(data))
+                start = idx[0] if len(idx) else len(data)
+                times, data = times[start:], data[start:]
+            curve.setPen(self.mne.mkPen(_get_color(overlay["color"], self.mne.dark)))
+            curve.setTransform(self.transform())
+            curve.setData(
+                times,
+                data,
+                connect="finite" if finite else "all",
+                skipFiniteCheck=not finite,
+                antialias=self.mne.antialiasing,
+            )
+            curve.setPos(0, self.ypos)
+            curve.setVisible(True)
 
     def toggle_bad(self, x=None):
         """Toggle bad status."""
@@ -1020,3 +1089,38 @@ class VLineLabel(InfLineLabel):
 
     def hoverEvent(self, ev):
         self.line.hoverEvent(ev)
+
+
+class OverlayLegend(LegendItem):
+    """Legend of the overlays (see ``plot_raw(overlay=...)``) that ignores the mouse.
+
+    PyQtGraph legends can be dragged around, but this one sits over the data, where
+    users click and drag (e.g., to annotate), so it must let those through.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._ignore_mouse(self)
+
+    def addItem(self, item, name):  # noqa: D102
+        super().addItem(item, name)
+        self._ignore_mouse(self)  # (the new samples and labels too)
+
+    @classmethod
+    def _ignore_mouse(cls, item):
+        # Otherwise Qt makes the item that is pressed (the legend, but also its
+        # samples and labels) grab the mouse, so that the data below doesn't get it.
+        item.setAcceptedMouseButtons(Qt.NoButton)
+        for child in item.childItems():
+            cls._ignore_mouse(child)
+
+    def hoverEvent(self, ev):  # noqa: D102
+        # (LegendItem would claim the drags that start here, which is how
+        # PyQtGraph chooses the item that gets a drag)
+        pass
+
+    def mouseDragEvent(self, ev):  # noqa: D102
+        ev.ignore()
+
+    def mouseClickEvent(self, ev):  # noqa: D102
+        ev.ignore()

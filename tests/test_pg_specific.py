@@ -1466,3 +1466,188 @@ def test_link_browsers_time_window_from_custom_figure(raw_orig, pg_backend):
         ui_events.publish(custom, ui_events.TimeWindowChange(tmin=tmin, tmax=tmax))
         assert window() == before
     plt.close(custom)
+
+
+def _has_overlay():
+    """Whether MNE-Python can plot overlays (>= 1.14, mne-python gh-13260)."""
+    import inspect
+
+    import mne
+
+    return "overlay" in inspect.signature(mne.io.Raw.plot).parameters
+
+
+def _overlay_pairs(fig, k=0):
+    """Get the (trace, overlay curve) data of the traces that have overlays."""
+    return [
+        (*(np.asarray(a) for a in t.getData()), *(np.asarray(a) for a in oc.getData()))
+        for t in fig.mne.traces
+        for oc in t.overlay_curves[k : k + 1]
+    ]
+
+
+@pytest.mark.parametrize("precompute", (False, True))
+def test_overlay(raw_orig, pg_backend, precompute):
+    """Test drawing overlays of other Raw objects (mne-python gh-13260)."""
+    if not _has_overlay():
+        # MNE-Python < 1.14 can't plot overlays (not a skip, CI doesn't allow them)
+        fig = raw_orig.plot(duration=4.0, splash=False)
+        assert not any(t.overlay_curves for t in fig.mne.traces)
+        return
+    raw = raw_orig.copy().pick(["eeg", "stim"])
+    fig = raw.plot(
+        duration=4.0,
+        n_channels=5,
+        splash=False,
+        precompute=precompute,
+        overlay={"copy": raw.copy()},
+    )
+    # a copy is drawn exactly like the data of the shown channels, while
+    # scrolling, zooming and changing the mode
+    for key in (None, "right", "end", "home", "down", "up", "b", "b", "d", "d"):
+        if key is not None:
+            fig._fake_keypress(key)
+        pairs = _overlay_pairs(fig)
+        assert len(pairs) == len(fig.mne.traces) > 0
+        for x0, y0, x1, y1 in pairs:
+            assert_allclose(x1, x0, atol=1e-12, err_msg=key)
+            assert_allclose(y1, y0, atol=1e-12, err_msg=key)
+        # (there is one overlay curve per trace and the legend names them)
+        assert all(len(t.overlay_curves) == 1 for t in fig.mne.traces)
+    legend_labels = [label.text for _, label in fig.mne.overlay_legend.items]
+    assert legend_labels == ["raw", "copy"]
+    # the curves are items of the plot, and go away with their trace
+    n_items = len(fig.mne.plt.items)
+    trace = fig.mne.traces[0]
+    curve = trace.overlay_curves[0]
+    assert curve in fig.mne.plt.items
+    trace.remove()
+    assert curve not in fig.mne.plt.items
+    assert len(fig.mne.plt.items) < n_items
+    fig.close()
+
+
+def test_overlay_data(raw_orig, pg_backend):
+    """Test that the overlays show the data aligned by time (mne-python gh-13260)."""
+    if not _has_overlay():
+        return  # MNE-Python < 1.14 can't plot overlays (not a skip, see above)
+    raw = raw_orig.copy().pick("eeg")
+    raw.del_proj()
+    sfreq = raw.info["sfreq"]
+    cropped = raw.copy().crop(tmin=2.0, tmax=8.0)
+    resampled = raw.copy().resample(sfreq / 2)
+    subset = raw.copy().pick(raw.ch_names[:2])
+    fig = raw.plot(
+        duration=4.0,
+        n_channels=5,
+        splash=False,
+        proj=False,
+        overlay=dict(cropped=cropped, resampled=resampled, subset=subset),
+    )
+    shown = [fig.mne.ch_names[i] for i in fig.mne.picks]
+    for t_key in ("home", "right", "right", "end"):
+        fig._fake_keypress(t_key)
+        x0, x1 = fig.mne.viewbox.viewRange()[0]
+        for trace in fig.mne.traces:
+            cropped_curve, resampled_curve, subset_curve = trace.overlay_curves
+            # the cropped copy has no data before 2 s and after 8 s
+            cx, cy = cropped_curve.getData()
+            if cx is not None and len(cx) and cropped_curve.isVisible():
+                assert cx[0] >= 2.0 - 1 / sfreq
+                assert cx[-1] <= 8.0 + 1 / sfreq
+            # the resampled copy has half the samples over the same time span
+            rx, _ = resampled_curve.getData()
+            px, _ = trace.getData()
+            assert abs(len(rx) * 2 - len(px)) <= 3
+            assert_allclose([rx[0], rx[-1]], [px[0], px[-1]], atol=3 / sfreq)
+            # channels the overlay doesn't have are not drawn for it
+            sy = subset_curve.getData()[1]
+            has_data = sy is not None and bool(np.isfinite(sy).any())
+            assert has_data == (trace.ch_name in subset.ch_names)
+    assert len(shown) == 5
+    fig.close()
+
+
+def test_overlay_annotations(raw_orig, pg_backend):
+    """Test that annotating also annotates the overlays (mne-python gh-13260)."""
+    if not _has_overlay():
+        return  # MNE-Python < 1.14 can't plot overlays (not a skip, see above)
+    from mne.viz._figure import BrowserBase
+
+    if not hasattr(BrowserBase, "_publish_annotations_change"):
+        return  # (needs the UI events of mne-python gh-13260 too)
+    raw = raw_orig.copy().pick("eeg")
+    raw.del_proj()
+    raw.set_annotations(None)
+    same = raw.copy()
+    cropped = raw.copy().crop(tmin=1.0)  # starts later in the acquisition
+    fig = raw.plot(duration=5.0, n_channels=5, splash=False, overlay=[same, cropped])
+    fig._fake_keypress("a")  # annotation mode
+    fig.mne.fig_annotation._add_description("BAD test")
+    kw = dict(xform="data", button=1, kind="drag")
+    fig._fake_click((0.5, 1.0), add_points=[(3.0, 1.0)], **kw)
+    assert len(raw.annotations) == 1
+    assert_allclose(same.annotations.onset, raw.annotations.onset)
+    assert_allclose(same.annotations.duration, raw.annotations.duration)
+    # clipped to what the cropped copy has
+    assert len(cropped.annotations) == 1
+    assert_allclose(cropped.annotations.onset, [cropped.first_time], atol=1e-6)
+    assert_allclose(
+        cropped.annotations.onset + cropped.annotations.duration,
+        raw.annotations.onset + raw.annotations.duration,
+    )
+    assert list(cropped.annotations.description) == ["BAD test"]
+    # and removing it
+    fig._fake_click((2.0, 1.0), xform="data", button=3, kind="press")
+    assert len(raw.annotations) == len(same.annotations) == 0
+    assert len(cropped.annotations) == 0
+    fig.close()
+
+
+def test_overlay_legend_ignores_mouse(raw_orig, pg_backend):
+    """Test that the overlay legend doesn't take mouse drags (mne-python gh-13260).
+
+    PyQtGraph legends can be dragged, which made one that sits over the data take the
+    drag of a user who wants to annotate there (and move away).
+    """
+    if not _has_overlay():
+        return  # MNE-Python < 1.14 can't plot overlays (not a skip, see above)
+    from mne.viz._figure import BrowserBase
+    from qtpy.QtTest import QTest
+
+    if not hasattr(BrowserBase, "_publish_annotations_change"):
+        return  # (this uses the annotation editing of the same MNE-Python version)
+    raw = raw_orig.copy().pick("eeg")
+    raw.del_proj()
+    raw.set_annotations(None)
+    fig = raw.plot(
+        duration=4.0,
+        n_channels=5,
+        splash=False,
+        overlay={"a filtered copy": raw.copy(), "another, longer name": raw.copy()},
+    )
+    fig.show()
+    QTest.qWait(300)  # (the layout of the shown window)
+    legend = fig.mne.overlay_legend
+    fig._fake_keypress("a")  # annotation mode
+    fig.mne.fig_annotation._add_description("BAD test")
+    assert len(raw.annotations) == 0
+    # a point on the legend, in the coordinates of the data
+    center = fig.mne.viewbox.mapFromItemToView(legend, legend.boundingRect().center())
+    x, y = center.x(), center.y()
+    view_width = fig.mne.viewbox.boundingRect().width()
+    assert legend.pos().x() + legend.boundingRect().width() == pytest.approx(
+        view_width - 10, abs=1
+    )
+    # drag an annotation, starting on the legend
+    fig._fake_click(
+        (x, y), add_points=[(x - 1.0, y)], xform="data", button=1, kind="drag"
+    )
+    QTest.qWait(100)
+    assert len(raw.annotations) == 1
+    assert_allclose(raw.annotations.duration, [1.0], atol=0.05)
+    # and the legend stayed in the top right corner of the view
+    assert legend.pos().x() + legend.boundingRect().width() == pytest.approx(
+        view_width - 10, abs=1
+    )
+    fig.close()
